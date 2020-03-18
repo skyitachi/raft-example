@@ -344,6 +344,7 @@ dependencies = [
 name = "raft-example"
 version = "0.1.0"
 dependencies = [
+ "protobuf 2.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "raft 0.6.0-alpha (registry+https://github.com/rust-lang/crates.io-index)",
  "slog 2.5.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "slog-term 2.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
