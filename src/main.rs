@@ -73,12 +73,14 @@ fn main() {
                let mut proposals = proposals.lock().unwrap();
                for p in proposals.iter_mut().skip_while(|p| p.proposed > 0) {
                    info!(logger, "[raft {}] leader propose message", raft_group.raft.id);
-                   propose(raft_group, p);
+                   propose(raft_group, p, &logger);
                }
            }
            on_ready(raft_group, &mut node.kv_pairs, &node.mailboxes, &proposals, &logger);
-
-           if check_signals(&rx_stop_clone) {
+           if check_signals(&rx_stop_clone, &logger) {
+               if let Some(raft_group) = node.raft_group {
+                   info!(&logger, "[raft {}] receive terminate signals", raft_group.raft.id);
+               }
                return;
            }
        });
@@ -89,15 +91,20 @@ fn main() {
     // important
     add_all_followers(proposals.as_ref(), &logger);
 
-    (0..2u16)
-        .filter(|i| {
-            let (proposal, rx) = Proposal::normal(*i, "hello world".to_owned());
-            proposals.lock().unwrap().push_back(proposal);
-            rx.recv().unwrap()
-        })
-        .count();
+    // (0..2u16)
+    //     .filter(|i| {
+    //         let (proposal, rx) = Proposal::normal(*i, "hello world".to_owned());
+    //         proposals.lock().unwrap().push_back(proposal);
+    //         let ret = rx.recv().unwrap();
+    //         return ret;
 
+    //     })
+    //     .count();
+
+
+    thread::sleep(Duration::from_secs(5));
     for _ in 0..NUM_NODES {
+        info!(&logger, "send terminate signal to raft cluster");
         tx_stop.send(Signal::Terminate).unwrap();
     }
 
@@ -135,7 +142,7 @@ impl Node {
     ) -> Self {
         let mut cfg = example_config();
         cfg.id = id;
-        let logger = logger.new(o!("tag" => format!("peer{}", id)));
+        let logger = logger.new(o!("tag" => format!("peer_{}", id)));
         let storage = MemStorage::new_with_conf_state(ConfState::from((vec![id], vec![])));
         let raft_group = Some(RawNode::new(&cfg, storage).unwrap().with_logger(&logger));
         Node {
@@ -159,7 +166,7 @@ impl Node {
     }
 
     fn initialize_raft_from_message(&mut self, msg: &Message, logger: &slog::Logger) {
-        info!(logger, "initialliz_raft_from_message {}", msg.to);
+        info!(logger, "initialize_raft_from_message {}", msg.to);
         if !is_initial_msg(msg) {
             return;
         }
@@ -225,17 +232,26 @@ impl Proposal {
     }
 }
 
-fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal) {
+fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal, logger: &slog::Logger) {
    let last_index1 = raft_group.raft.raft_log.last_index() + 1;
    if let Some((ref key, ref value)) = proposal.normal {
        let data = format!("put {} {}", key, value).into_bytes();
        let _ = raft_group.propose(vec![], data);
    } else if let Some(ref cc) = proposal.conf_change {
-       let _ = raft_group.propose_conf_change(vec![], cc.clone());
+       info!(logger, "propose_conf_change message to [raft {}]", cc.node_id);
+       if let Err(e) = raft_group.propose_conf_change(vec![], cc.clone()) {
+           info!(logger, "propose_conf_change message to [raft {}] failed {:?}", cc.node_id, e);
+       } else {
+           info!(logger, "propose_conf_change message to [raft {}] success", cc.node_id);
+       }
+    
    }
 
    let last_index2 = raft_group.raft.raft_log.last_index() + 1;
    if last_index2 == last_index1 {
+       if let Some(ref cc) = proposal.conf_change {
+           info!(logger, "proposal failed to propose to [raft {}]", cc.node_id);
+       }
        proposal.propose_success.send(false).unwrap();
    } else {
        proposal.proposed = last_index1;
@@ -264,15 +280,26 @@ fn on_ready(
         return;
     }
 
+    // apply snapshot
+    if *ready.snapshot() != Snapshot::default() {
+        let s = ready.snapshot().clone();
+        if let Err(e) = store.wl().apply_snapshot(s) {
+            error!(logger, "[raft {}] persistent snapshot error {:?}", node_id, e);
+            return;
+        }
+    }
+
     info!(logger, "[raft {}], entries len {}", node_id, ready.entries().len());
 
     for msg in ready.messages.drain(..) {
         let to = msg.to;
         // send msg to other node
+        info!(logger, "[raft {}] send {:?} message to [raft {}]", node_id, msg.get_msg_type(), to);
         if mailboxes[&to].send(msg).is_err() {
             error!(logger, "[raft {}] send raft message to [raft {}] fail", node_id, to);
         }
     }
+
 
     if let Some(committed_entries) = ready.committed_entries.take() {
         for entry in &committed_entries {
@@ -283,7 +310,7 @@ fn on_ready(
                 let mut cc = ConfChange::default();
                 cc.merge_from_bytes(&entry.data).unwrap();
                 let node_id = cc.node_id;
-                info!(logger, "[raft {}] receive addnode {}", raft_group.raft.id, node_id);
+                info!(logger, "[raft {}] receive addnode {}, change type: {:?}", raft_group.raft.id, node_id, cc.get_change_type());
                 match cc.get_change_type() {
                     ConfChangeType::AddNode => raft_group.raft.add_node(node_id).unwrap(),
                     _ => info!(logger, "get unexpected confchange type"),
@@ -292,16 +319,13 @@ fn on_ready(
                 store.wl().set_conf_state(cs, None);
             }
             if raft_group.raft.state == StateRole::Leader {
-                let proposal = match proposals.lock().unwrap().pop_front() {
-                    Some(p) => p,
-                    None => {
-                        info!(logger, "[raft {}] receive empty proposal", raft_group.raft.id);
-                        continue;
+                if let Some(proposal) = proposals.lock().unwrap().pop_front() {
+                    if let Some(conf_change) = proposal.conf_change {
+                        info!(logger, "conf_change proposal success [raft {}]", conf_change.node_id);
                     }
-                };
-                proposal.propose_success.send(true).unwrap();
+                    proposal.propose_success.send(true).unwrap();
+                }
             }
-    
         }
         if let Some(last_committed) = committed_entries.last() {
             let mut s = store.wl();
@@ -312,7 +336,7 @@ fn on_ready(
     raft_group.advance(ready);
 }
 
-fn check_signals(receiver: &Arc<Mutex<mpsc::Receiver<Signal>>>) -> bool {
+fn check_signals(receiver: &Arc<Mutex<mpsc::Receiver<Signal>>>, logger: &slog::Logger) -> bool {
     match receiver.lock().unwrap().try_recv() {
         Ok(Signal::Terminate) => true,
         Err(TryRecvError::Empty) => false,
@@ -330,6 +354,7 @@ fn add_all_followers(proposals: &Mutex<VecDeque<Proposal>>, logger: &slog::Logge
             proposals.lock().unwrap().push_back(proposal);
             info!(logger, "[raft {}] make confchange", i);
             if rx.recv().unwrap() {
+                info!(logger, "[raft {}] receive confchange proposal", i);
                 break;
             }
             thread::sleep(Duration::from_millis(100));
